@@ -1,160 +1,107 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import yfinance as yf
-import pandas as pd
-import numpy as np
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error
+import requests
 import logging
-import os
-import time
-from datetime import datetime, timedelta
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error
+from json.decoder import JSONDecodeError
+from datetime import datetime
 
-# Logging setup
+# Logger setup
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
 
-# FastAPI instance
-app = FastAPI(title="Stock Return Predictor API")
+# --- CONFIG ---
+API_URL = "https://your-stock-api.com/data?ticker={ticker}"  # Example, replace with real one
+TICKER = "TCS.NS"
+INVESTMENT_AMOUNT = 10000000.0
+INVESTMENT_DAYS = 6
 
-# Input model
-class PredictionRequest(BaseModel):
-    ticker: str
-    investment_amount: float
-    investment_days: int
 
-# Cache directory
-CACHE_DIR = "stock_data_cache"
-os.makedirs(CACHE_DIR, exist_ok=True)
+# --- SYNTHETIC FALLBACK DATA FUNCTION ---
+def get_synthetic_data():
+    logging.warning("Using synthetic fallback data.")
+    np.random.seed(42)
+    dates = pd.date_range(end=datetime.today(), periods=236)
+    prices = np.cumsum(np.random.normal(loc=0.1, scale=1.0, size=len(dates))) + 3500
+    return pd.DataFrame({'date': dates, 'close': prices})
 
-def get_cache_path(ticker: str, period: str) -> str:
-    return os.path.join(CACHE_DIR, f"{ticker}_{period}.csv")
 
-def is_cache_valid(path: str, max_age_hours: int = 24) -> bool:
-    if not os.path.exists(path):
-        return False
-    age = datetime.now() - datetime.fromtimestamp(os.path.getmtime(path))
-    return age < timedelta(hours=max_age_hours)
-
-def fetch_stock_data(ticker: str, period="5y") -> pd.DataFrame:
-    cache_path = get_cache_path(ticker, period)
-
-    if is_cache_valid(cache_path):
-        try:
-            logger.info(f"Using cached data for {ticker}")
-            df = pd.read_csv(cache_path, parse_dates=["Date"])
-            return df
-        except Exception as e:
-            logger.warning(f"Failed to read cache: {e}")
-
+# --- DATA FETCH FUNCTION ---
+def fetch_stock_data(ticker):
     try:
-        logger.info(f"Fetching data using yf.download for {ticker}")
-        df = yf.download(ticker, period=period, progress=False)
-        if not df.empty:
-            df.reset_index(inplace=True)
-            df.to_csv(cache_path, index=False)
-            return df
-    except Exception as e:
-        logger.warning(f"yf.download failed: {e}")
+        url = API_URL.format(ticker=ticker)
+        response = requests.get(url, timeout=5)
 
-    logger.warning("Using synthetic fallback data.")
-    dates = pd.date_range(end=datetime.today(), periods=252)
-    prices = np.linspace(100, 150, len(dates)) + np.random.normal(0, 5, len(dates))
-    df = pd.DataFrame({
-        'Date': dates,
-        'Open': prices * 0.99,
-        'High': prices * 1.02,
-        'Low': prices * 0.98,
-        'Close': prices,
-        'Volume': np.random.randint(1e6, 1e7, len(dates)),
-        'synthetic': True
-    })
-    df.to_csv(os.path.join(CACHE_DIR, "synthetic_data.csv"), index=False)
-    return df
+        if response.status_code == 200 and response.content.strip():
+            try:
+                json_data = response.json()
+                df = pd.DataFrame(json_data['historical'])
+                df = df[['date', 'close']]
+                df['date'] = pd.to_datetime(df['date'])
+                return df
+            except (KeyError, JSONDecodeError) as e:
+                logging.error(f"[{ticker}]: JSON decode failed or key error: {e}")
+                return get_synthetic_data()
+        else:
+            logging.error(f"[{ticker}]: API returned status {response.status_code} or empty content.")
+            return get_synthetic_data()
 
-def engineer_features(df: pd.DataFrame, days: int) -> pd.DataFrame:
-    df['Return'] = df['Close'].pct_change()
-    df['MA_5'] = df['Close'].rolling(5).mean()
-    df['MA_10'] = df['Close'].rolling(10).mean()
-    df['Volatility'] = df['Return'].rolling(10).std()
-    df[f'Target_{days}d'] = df['Close'].shift(-days) / df['Close'] - 1
-    df.dropna(inplace=True)
+    except requests.RequestException as e:
+        logging.error(f"[{ticker}]: Request failed: {e}")
+        return get_synthetic_data()
 
-    if df.empty:
-        raise ValueError("Not enough data after processing. Try shorter investment days.")
 
-    return df
+# --- MODEL TRAINING & PREDICTION ---
+def train_and_predict(df, investment_days, investment_amount):
+    df = df.sort_values("date")
+    df['return'] = df['close'].pct_change().fillna(0)
 
-def train_model(df: pd.DataFrame, days: int):
-    features = ['Return', 'MA_5', 'MA_10', 'Volatility']
-    target = f'Target_{days}d'
+    df['future_price'] = df['close'].shift(-investment_days)
+    df = df.dropna()
 
-    X, y = df[features], df[target]
-    if X.empty or y.empty:
-        raise ValueError("Insufficient data for training.")
+    df['target_return'] = (df['future_price'] - df['close']) / df['close']
+    X = df[['return']]
+    y = df['target_return']
 
-    X_train, X_test, y_train, y_test = train_test_split(X, y, shuffle=False, test_size=0.2)
-    model = RandomForestRegressor(n_estimators=100, random_state=42)
-    model.fit(X_train, y_train)
-    preds = model.predict(X_test)
-    rmse = np.sqrt(mean_squared_error(y_test, preds))
-    logger.info(f"Model trained with RMSE: {rmse:.4f}")
-    return model, df
+    model = RandomForestRegressor(random_state=42)
+    model.fit(X, y)
 
-def assess_risk(pred_return: float) -> str:
-    if pred_return > 0.2:
-        return "High Gain (High Risk)"
-    elif pred_return > 0.05:
-        return "Moderate Gain (Medium Risk)"
-    elif pred_return > -0.05:
-        return "Low Gain or Neutral (Low Risk)"
-    else:
-        return "Potential Loss (High Risk)"
+    rmse = np.sqrt(mean_squared_error(y, model.predict(X)))
+    logging.info(f"Model trained with RMSE: {rmse:.4f}")
 
-@app.get("/")
-def read_root():
-    return {
-        "message": "Welcome to the Stock Return Predictor API 🚀",
-        "usage": "POST /predict with ticker, investment_amount, and investment_days."
+    # Make a prediction based on latest data
+    latest_return = df.iloc[-1]['return']
+    pred = model.predict([[latest_return]])[0]
+
+    predicted_value = investment_amount * (1 + pred)
+    result = {
+        "ticker": TICKER,
+        "investment_amount": investment_amount,
+        "investment_days": investment_days,
+        "predicted_return_percent": round(pred * 100, 2),
+        "predicted_value": round(predicted_value, 2),
+        "risk_level": assess_risk(pred),
+        "data_points_used": len(df),
+        "data_source": "synthetic fallback data" if "synthetic" in df.columns else "real API"
     }
 
-@app.post("/predict")
-def predict_return(request: PredictionRequest):
-    try:
-        logger.info(f"Received request: {request}")
-        if request.investment_amount <= 0 or request.investment_days <= 0:
-            raise ValueError("Investment amount and days must be greater than zero.")
+    logging.info(f"Response: {result}")
+    return result
 
-        ticker = request.ticker.strip().upper()
-        df = fetch_stock_data(ticker)
-        using_real_data = 'synthetic' not in df.columns
 
-        df = engineer_features(df, request.investment_days)
-        model, df = train_model(df, request.investment_days)
+# --- RISK ASSESSMENT LOGIC ---
+def assess_risk(pred_return):
+    if pred_return > 0.10:
+        return "High Gain (Moderate Risk)"
+    elif pred_return > 0.03:
+        return "Low Gain or Neutral (Low Risk)"
+    elif pred_return < -0.05:
+        return "High Risk of Loss"
+    else:
+        return "Slight Risk (Stable)"
 
-        latest = df.iloc[-1][['Return', 'MA_5', 'MA_10', 'Volatility']].values.reshape(1, -1)
-        predicted_return = model.predict(latest)[0]
-        predicted_value = request.investment_amount * (1 + predicted_return)
-        risk = assess_risk(predicted_return)
 
-        response = {
-            "ticker": ticker,
-            "investment_amount": request.investment_amount,
-            "investment_days": request.investment_days,
-            "predicted_return_percent": round(predicted_return * 100, 2),
-            "predicted_value": round(predicted_value, 2),
-            "risk_level": risk,
-            "data_points_used": len(df),
-            "data_source": "real market data" if using_real_data else "synthetic fallback data"
-        }
-
-        logger.info(f"Response: {response}")
-        return response
-
-    except ValueError as ve:
-        logger.error(f"Validation error: {ve}")
-        raise HTTPException(status_code=400, detail=str(ve))
-    except Exception as e:
-        logger.exception("Unhandled exception during prediction")
-        raise HTTPException(status_code=500, detail="Internal Server Error")
+# --- MAIN FLOW ---
+if __name__ == "__main__":
+    df = fetch_stock_data(TICKER)
+    result = train_and_predict(df, INVESTMENT_DAYS, INVESTMENT_AMOUNT)
